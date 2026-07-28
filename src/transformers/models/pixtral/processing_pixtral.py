@@ -15,6 +15,8 @@
 Processor class for Pixtral.
 """
 
+from typing import Any
+
 import numpy as np
 
 from ...processing_utils import (
@@ -85,6 +87,42 @@ class PixtralProcessor(ProcessorMixin):
         self.image_token_id = tokenizer.convert_tokens_to_ids(self.image_token)
         self.image_break_token_id = tokenizer.convert_tokens_to_ids(self.image_break_token)
         self.image_end_token_id = tokenizer.convert_tokens_to_ids(self.image_end_token)
+
+    @property
+    def _uses_mistral_common_backend(self) -> bool:
+        return self.tokenizer.__class__.__name__ == "MistralCommonBackend"
+
+    def apply_chat_template(
+        self,
+        conversation: list[dict[str, str]] | list[list[dict[str, str]]],
+        *args: Any,
+        **kwargs: Any,
+    ) -> Any:
+        """Apply the Pixtral chat format while preserving typed content with MistralCommonBackend."""
+        if not self._uses_mistral_common_backend:
+            return super().apply_chat_template(conversation, *args, **kwargs)
+
+        if args:
+            raise ValueError("PixtralProcessor requires keyword arguments with MistralCommonBackend.")
+
+        unsupported_names = ("chat_template", "documents", "return_assistant_tokens_mask", "load_audio_from_video")
+        unsupported = [name for name in unsupported_names if kwargs.pop(name, None) not in (None, False)]
+        if unsupported:
+            raise ValueError(
+                f"MistralCommonBackend does not support these Pixtral chat-template arguments: {', '.join(unsupported)}"
+            )
+
+        tokenizer_kwargs = dict(kwargs.pop("processor_kwargs", None) or {})
+        tokenizer_kwargs.update(kwargs)
+        return self.tokenizer.apply_chat_template(conversation, **tokenizer_kwargs)
+
+    def validate_inputs(self, images: Any | None = None, **kwargs: Any) -> None:
+        if self._uses_mistral_common_backend and images is not None:
+            raise ValueError(
+                "PixtralProcessor cannot combine flat text and images with MistralCommonBackend. "
+                "Use `apply_chat_template(..., tokenize=True, return_dict=True)` with typed image content blocks instead."
+            )
+        super().validate_inputs(images=images, **kwargs)
 
     @property
     def image_token_ids(self) -> list[int]:

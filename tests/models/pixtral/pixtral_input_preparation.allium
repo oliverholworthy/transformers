@@ -1,0 +1,16 @@
+-- allium: 1
+
+contract PixtralInputPreparation {
+    prepare_tokenized_chat: (conversation: Conversation) -> ModelInput
+
+    @invariant TypedTextIsText
+        -- Text content is encoded as text even when it spells an image control token
+        -- such as [IMG], [IMG_BREAK], or [IMG_END].
+
+    @invariant TypedImagesCreateImageStructure
+        -- Only typed image content blocks create image tokens and image features.
+
+    @invariant ImageCardinalityMatches
+        -- Every encoded image placeholder has one corresponding image input, and
+        -- every image input has one corresponding encoded image placeholder.
+}

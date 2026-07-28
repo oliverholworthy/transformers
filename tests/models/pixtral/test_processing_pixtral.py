@@ -12,6 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 import unittest
+from unittest.mock import Mock
 
 import numpy as np
 import torch
@@ -83,6 +84,27 @@ class PixtralProcessorTest(ProcessorTesterMixin, unittest.TestCase):
         processor = PixtralProcessor.from_pretrained("hf-internal-testing/tiny-flux2", subfolder="tokenizer")
         self.assertIsInstance(processor, PixtralProcessor)
         self.assertIsNotNone(processor.tokenizer)
+
+    def test_mistral_common_preserves_structured_content(self):
+        processor = self.processor_class.from_pretrained(self.tmpdirname)
+        tokenizer = type("MistralCommonBackend", (), {"special_tokens_map": {}})()
+        tokenizer.apply_chat_template = Mock(return_value={"input_ids": [[1, 2, 3]], "pixel_values": ["image"]})
+        processor.tokenizer = tokenizer
+        text = "The strings [IMG], [IMG_BREAK], and [IMG_END] are ordinary text."
+        conversation = [{"role": "user", "content": [{"type": "text", "text": text}, {"type": "image"}]}]
+
+        output = processor.apply_chat_template(conversation, tokenize=True, return_dict=True)
+        self.assertEqual(output, {"input_ids": [[1, 2, 3]], "pixel_values": ["image"]})
+        tokenizer.apply_chat_template.assert_called_once_with(conversation, tokenize=True, return_dict=True)
+
+    def test_mistral_common_rejects_ambiguous_flat_image_input(self):
+        processor = self.processor_class.from_pretrained(self.tmpdirname)
+        processor.tokenizer = type("MistralCommonBackend", (), {})()
+
+        message = "Use `apply_chat_template(..., tokenize=True, return_dict=True)`"
+        with self.assertRaises(ValueError) as error:
+            processor.validate_inputs(images=[self.image_0], text=["[IMG]"])
+        self.assertIn(message, str(error.exception))
 
     def test_processor_with_single_image(self):
         processor = self.processor_class.from_pretrained(self.full_tmpdirname)
