@@ -11,6 +11,7 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+import re
 import unittest
 
 import numpy as np
@@ -83,6 +84,192 @@ class PixtralProcessorTest(ProcessorTesterMixin, unittest.TestCase):
         processor = PixtralProcessor.from_pretrained("hf-internal-testing/tiny-flux2", subfolder="tokenizer")
         self.assertIsInstance(processor, PixtralProcessor)
         self.assertIsNotNone(processor.tokenizer)
+
+    def test_tokenizers_backend_preserves_image_id_parity_when_splitting_special_tokens(self):
+        processor = self.processor_class.from_pretrained(self.full_tmpdirname)
+        processor.tokenizer.split_special_tokens = True
+        processor.image_processor.size = {"longest_edge": 30}
+        processor.image_processor.patch_size = {"height": 2, "width": 2}
+
+        prompt = "USER: [IMG] describe it"
+        inputs = processor(text=prompt, images=self.image_0, return_tensors=None)
+        flat_expansion = "USER: [IMG][IMG][IMG_BREAK][IMG][IMG][IMG_END] describe it"
+        expected = processor.tokenizer(
+            flat_expansion,
+            add_special_tokens=True,
+            split_special_tokens=False,
+            return_tensors=None,
+        )
+
+        self.assertEqual(inputs["input_ids"], [expected["input_ids"]])
+
+    def test_tokenizers_backend_does_not_activate_unconsumed_literal_image_markers(self):
+        processor = self.processor_class.from_pretrained(self.full_tmpdirname)
+        processor.tokenizer.split_special_tokens = True
+        processor.image_processor.size = {"longest_edge": 30}
+        processor.image_processor.patch_size = {"height": 2, "width": 2}
+        prompt = "Image: [IMG]. Literal text: [IMG] and [IMG_END]."
+
+        processor.tokenizer.split_special_tokens = False
+        baseline = processor(text=prompt, images=self.image_0, return_tensors=None)
+        self.assertEqual(baseline["input_ids"][0].count(processor.image_token_id), 5)
+        self.assertEqual(baseline["input_ids"][0].count(processor.image_end_token_id), 2)
+
+        processor.tokenizer.split_special_tokens = True
+        inputs = processor(text=prompt, images=self.image_0, return_tensors=None)
+        input_ids = inputs["input_ids"][0]
+        self.assertEqual(input_ids.count(processor.image_token_id), 4)
+        self.assertEqual(input_ids.count(processor.image_break_token_id), 1)
+        self.assertEqual(input_ids.count(processor.image_end_token_id), 1)
+
+    def test_flat_text_uses_the_first_image_marker_as_the_placeholder(self):
+        processor = self.processor_class.from_pretrained(self.full_tmpdirname)
+        processor.tokenizer.split_special_tokens = True
+        processor.image_processor.size = {"longest_edge": 30}
+        processor.image_processor.patch_size = {"height": 2, "width": 2}
+        prompt = "Literal first [IMG], intended placeholder [IMG]"
+
+        inputs = processor(
+            text=prompt,
+            images=self.image_0,
+            return_tensors=None,
+            return_text_replacement_offsets=True,
+        )
+
+        # Flat text carries no ownership metadata, so its first marker is the processor-designated placeholder.
+        self.assertEqual(inputs["text_replacement_offsets"][0][0]["span"], (14, 19))
+
+    def test_chat_template_preserves_image_token_ownership(self):
+        processor = self.processor_class.from_pretrained(self.full_tmpdirname)
+        processor.tokenizer.split_special_tokens = True
+        processor.image_processor.size = {"longest_edge": 30}
+        processor.image_processor.patch_size = {"height": 2, "width": 2}
+        messages = [
+            {
+                "role": "user",
+                "content": [
+                    {"type": "text", "text": "Literal first [IMG]. "},
+                    {"type": "image", "image": self.image_0},
+                    {"type": "text", "text": " Literal last [IMG] and [IMG_END]."},
+                ],
+            }
+        ]
+
+        inputs = processor.apply_chat_template(
+            messages,
+            tokenize=True,
+            return_dict=True,
+            return_tensors=None,
+            processor_kwargs={"return_text_replacement_offsets": True},
+        )
+
+        input_ids = inputs["input_ids"][0].tolist()
+        self.assertEqual(input_ids.count(processor.image_token_id), 4)
+        self.assertEqual(input_ids.count(processor.image_break_token_id), 1)
+        self.assertEqual(input_ids.count(processor.image_end_token_id), 1)
+        self.assertEqual(len(inputs["text_replacement_offsets"][0]), 1)
+        rendered_prompt = processor.apply_chat_template(messages, tokenize=False)
+        owned_start = rendered_prompt.find(processor.image_token, rendered_prompt.find(processor.image_token) + 1)
+        self.assertEqual(
+            inputs["text_replacement_offsets"][0][0]["span"],
+            (owned_start, owned_start + len(processor.image_token)),
+        )
+
+    def test_chat_template_preserves_image_token_ownership_in_batches(self):
+        processor = self.processor_class.from_pretrained(self.full_tmpdirname)
+        processor.tokenizer.split_special_tokens = True
+        processor.image_processor.size = {"longest_edge": 30}
+        processor.image_processor.patch_size = {"height": 2, "width": 2}
+        conversations = [
+            [
+                {
+                    "role": "user",
+                    "content": [
+                        {"type": "text", "text": "Literal first [IMG]. "},
+                        {"type": "image", "image": self.image_0},
+                    ],
+                }
+            ],
+            [
+                {
+                    "role": "user",
+                    "content": [
+                        {"type": "text", "text": "Literal before [IMG]. "},
+                        {"type": "image", "image": self.image_1},
+                        {"type": "text", "text": " Literal between [IMG]. "},
+                        {"type": "image", "image": self.image_2},
+                    ],
+                }
+            ],
+        ]
+
+        inputs = processor.apply_chat_template(
+            conversations,
+            tokenize=True,
+            return_dict=True,
+            return_tensors=None,
+            processor_kwargs={"return_text_replacement_offsets": True, "padding": True},
+        )
+
+        self.assertEqual([len(offsets) for offsets in inputs["text_replacement_offsets"]], [1, 2])
+        for batch_idx, (rendered_prompt, offsets) in enumerate(
+            zip(processor.apply_chat_template(conversations, tokenize=False), inputs["text_replacement_offsets"])
+        ):
+            marker_starts = [match.start() for match in re.finditer(re.escape(processor.image_token), rendered_prompt)]
+            expected_starts = marker_starts[1::2] if batch_idx else marker_starts[1:]
+            self.assertEqual(
+                [offset["span"] for offset in offsets],
+                [(start, start + len(processor.image_token)) for start in expected_starts],
+            )
+
+    def test_chat_template_fails_closed_when_literal_ownership_cannot_be_tracked(self):
+        processor = self.processor_class.from_pretrained(self.full_tmpdirname)
+        processor.tokenizer.split_special_tokens = True
+        messages = [
+            {
+                "role": "user",
+                "content": [
+                    {"type": "text", "text": "Literal [IMG]."},
+                    {"type": "image", "image": self.image_0},
+                ],
+            }
+        ]
+        transforming_template = "{% for block in messages[0]['content'] %}{% if block['type'] == 'text' %}{{ block['text'] | lower }}{% else %}[IMG]{% endif %}{% endfor %}"
+
+        with self.assertRaisesRegex(ValueError, "ownership cannot be tracked safely"):
+            processor.apply_chat_template(
+                messages,
+                chat_template=transforming_template,
+                tokenize=True,
+                return_dict=True,
+            )
+
+    def test_tokenizers_backend_rejects_partial_image_truncation(self):
+        processor = self.processor_class.from_pretrained(self.full_tmpdirname)
+        processor.tokenizer.split_special_tokens = True
+        processor.image_processor.size = {"longest_edge": 30}
+        processor.image_processor.patch_size = {"height": 2, "width": 2}
+
+        with self.assertRaisesRegex(ValueError, "Truncation would split a processor-owned special-token span"):
+            processor(
+                text="[IMG] trailing text",
+                images=self.image_0,
+                truncation=True,
+                max_length=3,
+                return_tensors=None,
+            )
+
+        inputs = processor(
+            text="[IMG] trailing text",
+            images=self.image_0,
+            truncation=True,
+            max_length=6,
+            return_tensors=None,
+        )
+        self.assertEqual(
+            inputs["input_ids"],
+            [[10, 10, 12, 10, 10, 13]],
+        )
 
     def test_processor_with_single_image(self):
         processor = self.processor_class.from_pretrained(self.full_tmpdirname)

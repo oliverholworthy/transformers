@@ -2801,6 +2801,69 @@ class TokenizersBackendCommonTest(TokenizersBackendTesterMixin, unittest.TestCas
     from_pretrained_id = "google-bert/bert-base-uncased"
     from_pretrained_kwargs = {}
 
+    def test_processor_owned_special_token_spans(self):
+        tokenizer = self.get_rust_tokenizer()
+        control_token = "[CONTROL]"
+        tokenizer.add_special_tokens({"additional_special_tokens": [control_token]})
+        control_token_id = tokenizer.convert_tokens_to_ids(control_token)
+        text = f"{control_token} user text {control_token}"
+
+        encoded = tokenizer(
+            [text],
+            add_special_tokens=True,
+            padding="max_length",
+            max_length=12,
+            return_length=True,
+            return_offsets_mapping=True,
+            return_special_tokens_mask=True,
+            split_special_tokens=True,
+            _special_token_spans=[[(0, len(control_token))]],
+        )
+
+        self.assertEqual(encoded["input_ids"][0].count(control_token_id), 1)
+        control_index = encoded["input_ids"][0].index(control_token_id)
+        self.assertEqual(encoded["offset_mapping"][0][control_index], (0, len(control_token)))
+        self.assertEqual(encoded["length"], [12])
+        self.assertEqual(len(encoded["special_tokens_mask"][0]), 12)
+
+        tensor_encoded = tokenizer(
+            [text, f"{control_token} short"],
+            padding=True,
+            return_tensors="np",
+            split_special_tokens=True,
+            _special_token_spans=[[(0, len(control_token))], [(0, len(control_token))]],
+        )
+        self.assertEqual(tensor_encoded["input_ids"].shape[0], 2)
+        self.assertEqual(tensor_encoded["input_ids"].shape, tensor_encoded["attention_mask"].shape)
+
+        baseline = tokenizer([text], add_special_tokens=True, split_special_tokens=False)
+        with_ignored_spans = tokenizer(
+            [text],
+            add_special_tokens=True,
+            split_special_tokens=False,
+            _special_token_spans=[[(0, len(control_token))]],
+        )
+        self.assertEqual(with_ignored_spans, baseline)
+
+        with self.assertRaisesRegex(ValueError, "`only_second` requires a text pair"):
+            tokenizer(
+                [text],
+                truncation="only_second",
+                max_length=4,
+                split_special_tokens=True,
+                _special_token_spans=[[(0, len(control_token))]],
+            )
+
+        with self.assertRaisesRegex(ValueError, "Overflowing tokenization is not supported"):
+            tokenizer(
+                [text],
+                truncation=True,
+                max_length=4,
+                return_overflowing_tokens=True,
+                split_special_tokens=True,
+                _special_token_spans=[[(0, len(control_token))]],
+            )
+
 
 class SentencePieceBackendCommonTest(unittest.TestCase, SentencePieceBackendTesterMixin):
     """

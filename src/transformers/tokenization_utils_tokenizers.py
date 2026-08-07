@@ -922,6 +922,121 @@ class TokenizersBackend(PreTrainedTokenizerBase):
             if _padding != target:
                 self._tokenizer.enable_padding(**target)
 
+    def _encode_batch_with_special_token_spans(
+        self,
+        batch_text: list[str],
+        special_token_spans: list[list[tuple[int, int]]],
+        add_special_tokens: bool,
+        padding_strategy: PaddingStrategy,
+        truncation_strategy: TruncationStrategy,
+        max_length: int | None,
+        stride: int,
+        pad_to_multiple_of: int | None,
+        padding_side: str | None,
+        return_overflowing_tokens: bool,
+    ) -> list[EncodingFast]:
+        """Encode processor-owned spans as special tokens while splitting special tokens in user text."""
+        if len(batch_text) != len(special_token_spans):
+            raise ValueError("`_special_token_spans` must have one entry per input text.")
+        if stride or return_overflowing_tokens:
+            raise ValueError(
+                "Overflowing tokenization is not supported with processor-owned special-token spans. "
+                "Set `stride=0` and `return_overflowing_tokens=False`."
+            )
+        if truncation_strategy == TruncationStrategy.ONLY_SECOND:
+            raise ValueError("Truncation strategy `only_second` requires a text pair.")
+
+        backend_tokenizer = self.backend_tokenizer
+        self.set_truncation_and_padding(
+            padding_strategy=PaddingStrategy.DO_NOT_PAD,
+            truncation_strategy=TruncationStrategy.DO_NOT_TRUNCATE,
+            max_length=None,
+            stride=0,
+            pad_to_multiple_of=None,
+            padding_side=padding_side,
+        )
+
+        encodings = []
+        try:
+            for sample, sample_spans in zip(batch_text, special_token_spans):
+                if not isinstance(sample, str):
+                    raise TypeError("Processor-owned special-token spans require a batch of text strings.")
+
+                parts = []
+                token_spans = []
+                cursor = 0
+                token_cursor = 0
+                for start, end in sample_spans:
+                    if not 0 <= cursor <= start < end <= len(sample):
+                        raise ValueError(
+                            "Processor-owned special-token spans must be ordered, non-overlapping, and within the text."
+                        )
+
+                    backend_tokenizer.encode_special_tokens = True
+                    text_encoding = backend_tokenizer.encode(sample[cursor:start], add_special_tokens=False)
+                    parts.append(text_encoding)
+                    token_cursor += len(text_encoding)
+
+                    backend_tokenizer.encode_special_tokens = False
+                    special_encoding = backend_tokenizer.encode(sample[start:end], add_special_tokens=False)
+                    parts.append(special_encoding)
+                    token_spans.append((token_cursor, token_cursor + len(special_encoding)))
+                    token_cursor += len(special_encoding)
+                    cursor = end
+
+                backend_tokenizer.encode_special_tokens = True
+                parts.append(backend_tokenizer.encode(sample[cursor:], add_special_tokens=False))
+                encoding = EncodingFast.merge(parts)
+
+                if truncation_strategy != TruncationStrategy.DO_NOT_TRUNCATE and max_length is not None:
+                    num_added_tokens = self.num_special_tokens_to_add(pair=False) if add_special_tokens else 0
+                    content_length = max_length - num_added_tokens
+                    if content_length < 0:
+                        raise ValueError("`max_length` is too small to contain the tokenizer's special tokens.")
+                    if len(encoding) > content_length:
+                        boundary = (
+                            content_length if self.truncation_side == "right" else len(encoding) - content_length
+                        )
+                        if any(start < boundary < end for start, end in token_spans):
+                            raise ValueError(
+                                "Truncation would split a processor-owned special-token span. "
+                                "Increase `max_length` or disable truncation."
+                            )
+                        encoding.truncate(content_length, direction=self.truncation_side)
+
+                encodings.append(backend_tokenizer.post_process(encoding, add_special_tokens=add_special_tokens))
+
+            if padding_strategy != PaddingStrategy.DO_NOT_PAD:
+                if padding_strategy == PaddingStrategy.MAX_LENGTH:
+                    if max_length is None:
+                        raise ValueError("`max_length` must be set when padding to a fixed length.")
+                    target_length = max_length
+                else:
+                    target_length = max(map(len, encodings))
+                if pad_to_multiple_of is not None and target_length % pad_to_multiple_of:
+                    target_length = ((target_length // pad_to_multiple_of) + 1) * pad_to_multiple_of
+                for encoding in encodings:
+                    if len(encoding) < target_length:
+                        encoding.pad(
+                            target_length,
+                            direction=padding_side or self.padding_side,
+                            pad_id=self.pad_token_id,
+                            pad_type_id=self.pad_token_type_id,
+                            pad_token=self.pad_token,
+                        )
+        finally:
+            backend_tokenizer.encode_special_tokens = True
+            self.set_truncation_and_padding(
+                padding_strategy=padding_strategy,
+                truncation_strategy=truncation_strategy,
+                max_length=max_length,
+                stride=stride,
+                pad_to_multiple_of=pad_to_multiple_of,
+                padding_side=padding_side,
+            )
+
+        return encodings
+
     def _encode_plus(
         self,
         text: TextInput | PreTokenizedInput | list[TextInput] | list[PreTokenizedInput],
@@ -943,6 +1058,7 @@ class TokenizersBackend(PreTrainedTokenizerBase):
         return_length: bool = False,
         verbose: bool = True,
         split_special_tokens: bool | None = None,
+        _special_token_spans: list[list[tuple[int, int]]] | None = None,
         **kwargs,
     ) -> BatchEncoding:
         # Input validation (from _call_one)
@@ -1007,28 +1123,46 @@ class TokenizersBackend(PreTrainedTokenizerBase):
                 f"batch_text_or_text_pairs has to be a list or a tuple (got {type(batch_text_or_text_pairs)})"
             )
 
-        self.set_truncation_and_padding(
-            padding_strategy=padding_strategy,
-            truncation_strategy=truncation_strategy,
-            max_length=max_length,
-            stride=stride,
-            pad_to_multiple_of=pad_to_multiple_of,
-            padding_side=padding_side,
-        )
-
         # Use self.split_special_tokens as default if not explicitly provided
         if split_special_tokens is None:
             split_special_tokens = self.split_special_tokens
 
-        if self._tokenizer.encode_special_tokens != split_special_tokens:
-            self._tokenizer.encode_special_tokens = split_special_tokens
+        if split_special_tokens and _special_token_spans is not None:
+            if text_pair is not None or is_split_into_words:
+                raise ValueError(
+                    "Processor-owned special-token spans do not support text pairs or pretokenized inputs."
+                )
+            encodings = self._encode_batch_with_special_token_spans(
+                batch_text=batch_text_or_text_pairs,
+                special_token_spans=_special_token_spans,
+                add_special_tokens=add_special_tokens,
+                padding_strategy=padding_strategy,
+                truncation_strategy=truncation_strategy,
+                max_length=max_length,
+                stride=stride,
+                pad_to_multiple_of=pad_to_multiple_of,
+                padding_side=padding_side,
+                return_overflowing_tokens=return_overflowing_tokens,
+            )
+        else:
+            self.set_truncation_and_padding(
+                padding_strategy=padding_strategy,
+                truncation_strategy=truncation_strategy,
+                max_length=max_length,
+                stride=stride,
+                pad_to_multiple_of=pad_to_multiple_of,
+                padding_side=padding_side,
+            )
 
-        # Direct rust backend call
-        encodings = self._tokenizer.encode_batch(
-            batch_text_or_text_pairs,
-            add_special_tokens=add_special_tokens,
-            is_pretokenized=is_split_into_words,
-        )
+            if self._tokenizer.encode_special_tokens != split_special_tokens:
+                self._tokenizer.encode_special_tokens = split_special_tokens
+
+            # Direct rust backend call
+            encodings = self._tokenizer.encode_batch(
+                batch_text_or_text_pairs,
+                add_special_tokens=add_special_tokens,
+                is_pretokenized=is_split_into_words,
+            )
 
         # Convert encodings to BatchEncoding format
         tokens_and_encodings = [

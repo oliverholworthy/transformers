@@ -657,6 +657,7 @@ class ProcessorMixin(PushToHubMixin):
         audio: AudioInput | None = None,
         **kwargs: Unpack[ProcessingKwargs],
     ):
+        literal_mm_token_spans = typing.cast(dict[str, Any], kwargs).pop("_literal_mm_token_spans", None)
         images, text, videos, audio = self.prepare_inputs_layout(
             images=images, text=text, videos=videos, audio=audio, **kwargs
         )
@@ -690,9 +691,28 @@ class ProcessorMixin(PushToHubMixin):
                 images_replacements,
                 videos_replacements,
                 audio_replacements,
+                literal_mm_token_spans=literal_mm_token_spans,
             )
+            split_special_tokens = merged_kwargs["text_kwargs"].get(
+                "split_special_tokens", getattr(self.tokenizer, "split_special_tokens", False)
+            )
+            if (
+                split_special_tokens
+                and any(text_replacement_offsets)
+                and hasattr(self.tokenizer, "_encode_batch_with_special_token_spans")
+            ):
+                merged_kwargs["text_kwargs"]["_special_token_spans"] = [
+                    [replacement["new_span"] for replacement in offsets] for offsets in text_replacement_offsets
+                ]
             text_inputs = self.tokenizer(text, **merged_kwargs["text_kwargs"])
-            self._check_special_mm_tokens(text, text_inputs, modalities=["image", "video", "audio"])
+            replacement_text = [
+                "".join(item["replacement"] for item in offsets) for offsets in text_replacement_offsets
+            ]
+            self._check_special_mm_tokens(
+                replacement_text if split_special_tokens and any(text_replacement_offsets) else text,
+                text_inputs,
+                modalities=["image", "video", "audio"],
+            )
 
             if return_text_replacement_offsets:
                 text_inputs["text_replacement_offsets"] = text_replacement_offsets
@@ -818,6 +838,7 @@ class ProcessorMixin(PushToHubMixin):
         images_replacements: list[str] = [],
         videos_replacements: list[str] = [],
         audio_replacements: list[str] = [],
+        literal_mm_token_spans: list[list[tuple[int, int]]] | None = None,
     ) -> tuple[list[str], list[dict[str, Any]]]:
         """
         Replace multimodal placeholder tokens in a batch of text strings with their
@@ -849,6 +870,9 @@ class ProcessorMixin(PushToHubMixin):
             audio_replacements (`list[str]`, *optional*, defaults to `[]`):
                 Expanded replacement strings for each audio input. Produced by
                 `self._process_audio`.
+            literal_mm_token_spans (`list[list[tuple[int, int]]]`, *optional*):
+                Character spans of marker-like strings that came from structured text
+                content and must not consume multimodal replacements.
 
         Returns:
             `tuple[list[str], list[dict[str, Any]]]`: A tuple of:
@@ -883,8 +907,10 @@ class ProcessorMixin(PushToHubMixin):
             "video": iter(videos_replacements),
             "audio": iter(audio_replacements),
         }
+        no_replacement = object()
         batch_replacement_offsets = []
         for batch_idx in range(len(text)):
+            literal_spans = set(literal_mm_token_spans[batch_idx]) if literal_mm_token_spans is not None else set()
             last = 0
             offset = 0
             replacement_offsets = []
@@ -893,11 +919,20 @@ class ProcessorMixin(PushToHubMixin):
                 start, end = m.span()
                 expanded_sample.append(text[batch_idx][last:start])
 
+                if (start, end) in literal_spans:
+                    expanded_sample.append(m.group())
+                    last = end
+                    continue
+
                 # adjust spans using running offset if one sample has several MM data associated
                 start_with_offset = start + offset
 
                 mm_type = m.lastgroup
-                replacement_text = next(replacements_iters[mm_type])
+                replacement_text = next(replacements_iters[mm_type], no_replacement)
+                if replacement_text is no_replacement:
+                    expanded_sample.append(m.group())
+                    last = end
+                    continue
                 replacement_offsets.append(
                     {
                         "type": mm_type,
@@ -2182,6 +2217,90 @@ class ProcessorMixin(PushToHubMixin):
             **template_kwargs,
         )
 
+        literal_mm_token_spans = None
+        if tokenize:
+            multimodal_tokens = [
+                token
+                for token in (
+                    getattr(self, "image_token", None),
+                    getattr(self, "video_token", None),
+                    getattr(self, "audio_token", None),
+                )
+                if token
+            ]
+            shadow_conversations = []
+            for conversation in conversations:
+                shadow_conversation = []
+                for raw_message in conversation:
+                    message = typing.cast(dict[str, Any], raw_message)
+                    shadow_message = copy.copy(message)
+                    content = message.get("content")
+                    if isinstance(content, list):
+                        shadow_message["content"] = [
+                            copy.copy(block) if isinstance(block, dict) else block for block in content
+                        ]
+                    shadow_conversation.append(shadow_message)
+                shadow_conversations.append(shadow_conversation)
+            sentinel_to_token = {}
+            next_private_codepoint = 0xE000
+
+            for token in sorted(set(multimodal_tokens), key=len, reverse=True):
+                sentinel_char = chr(next_private_codepoint)
+                while sentinel_char in chat_template or any(sentinel_char in rendered for rendered in prompt):
+                    next_private_codepoint += 1
+                    sentinel_char = chr(next_private_codepoint)
+                sentinel = sentinel_char * len(token)
+                found_literal = False
+                for shadow_conversation in shadow_conversations:
+                    for message in shadow_conversation:
+                        content = message.get("content")
+                        if isinstance(content, str):
+                            if token in content:
+                                message["content"] = content.replace(token, sentinel)
+                                found_literal = True
+                            continue
+                        if not isinstance(content, list):
+                            continue
+                        for block in content:
+                            if not isinstance(block, dict) or block.get("type") != "text":
+                                continue
+                            for key in ("text", "content"):
+                                block_text = block.get(key)
+                                if isinstance(block_text, str) and token in block_text:
+                                    block[key] = block_text.replace(token, sentinel)
+                                    found_literal = True
+                if found_literal:
+                    sentinel_to_token[sentinel] = token
+                    next_private_codepoint += 1
+
+            if sentinel_to_token:
+                shadow_prompt, _ = render_jinja_template(
+                    conversations=shadow_conversations,
+                    tools=tools,
+                    documents=documents,
+                    chat_template=chat_template,
+                    return_assistant_tokens_mask=False,
+                    continue_final_message=continue_final_message,
+                    add_generation_prompt=add_generation_prompt,
+                    **template_kwargs,
+                )
+                literal_mm_token_spans = []
+                for rendered_prompt, rendered_shadow in zip(prompt, shadow_prompt):
+                    sample_spans = []
+                    restored_shadow = rendered_shadow
+                    for sentinel, token in sentinel_to_token.items():
+                        sample_spans.extend(
+                            (match.start(), match.end()) for match in re.finditer(re.escape(sentinel), rendered_shadow)
+                        )
+                        restored_shadow = restored_shadow.replace(sentinel, token)
+                    if restored_shadow != rendered_prompt:
+                        raise ValueError(
+                            "The chat template transforms text containing a multimodal placeholder, so its ownership "
+                            "cannot be tracked safely. Keep multimodal placeholder strings out of text content or use "
+                            "a template that renders text blocks verbatim."
+                        )
+                    literal_mm_token_spans.append(sorted(sample_spans))
+
         if not is_batched:
             prompt = prompt[0]
 
@@ -2206,6 +2325,8 @@ class ProcessorMixin(PushToHubMixin):
             # Set only is user passes a non-None value. Otherwise wa want to use each processor's own defaults
             if return_tensors:
                 processor_kwargs["return_tensors"] = return_tensors
+            if literal_mm_token_spans is not None:
+                processor_kwargs["_literal_mm_token_spans"] = literal_mm_token_spans
 
             images_exist = any((im is not None) for im_list in batch_images for im in im_list)
             videos_exist = any((vid is not None) for vid_list in batch_videos for vid in vid_list)
