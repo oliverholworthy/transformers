@@ -14,6 +14,7 @@
 """Testing suite for the PyTorch Pixtral model."""
 
 import unittest
+from unittest.mock import patch
 
 from transformers import (
     PixtralVisionConfig,
@@ -21,9 +22,12 @@ from transformers import (
     is_torch_available,
     logging,
 )
+from transformers.modeling_outputs import BaseModelOutputWithPooling
 from transformers.testing_utils import (
     CaptureLogger,
+    require_flash_attn,
     require_torch,
+    require_torch_gpu,
     torch_device,
 )
 
@@ -127,6 +131,42 @@ class PixtralVisionModelModelTest(ModelTesterMixin, unittest.TestCase):
             self.assertIsInstance(model.get_input_embeddings(), (torch.nn.Module))
             x = model.get_output_embeddings()
             self.assertTrue(x is None or isinstance(x, torch.nn.Linear))
+
+    def test_flash_attention_image_boundaries(self):
+        config = self.model_tester.get_config()
+        model = PixtralVisionModel(config).eval()
+        # Capture the metadata without requiring Flash Attention or launching its kernel.
+        config._attn_implementation = "flash_attention_2"
+        image_sizes = [(8, 8), (4, 6), (2, 8), (8, 2)]
+        pixel_values = torch.randn(4, 3, 8, 8)
+        with patch.object(model.transformer, "forward", return_value=BaseModelOutputWithPooling()) as forward:
+            model(pixel_values, image_sizes=image_sizes)
+
+        hidden_states = forward.call_args.args[0]
+        kwargs = forward.call_args.kwargs
+        expected = torch.tensor([0, 16, 22, 26, 30], dtype=torch.int32)
+        self.assertEqual(hidden_states.shape[1], 30)
+        self.assertIsNone(kwargs["attention_mask"])
+        self.assertNotIn("position_ids", kwargs)
+        for suffix in ("q", "k"):
+            torch.testing.assert_close(kwargs[f"cu_seq_lens_{suffix}"], expected)
+            self.assertEqual(kwargs[f"max_length_{suffix}"], 16)
+
+    @require_flash_attn
+    @require_torch_gpu
+    def test_flash_attention_2_matches_sdpa(self):
+        torch.manual_seed(0)
+        config = self.model_tester.get_config()
+        config.dtype = torch.float16
+        model = PixtralVisionModel(config).to(torch_device, dtype=torch.float16).eval()
+        for image_sizes in ([(8, 8)], [(8, 8), (4, 6), (2, 8), (8, 2)]):
+            with self.subTest(image_sizes=image_sizes), torch.inference_mode():
+                pixel_values = torch.randn(len(image_sizes), 3, 8, 8, device=torch_device, dtype=torch.float16)
+                model.set_attn_implementation("sdpa")
+                expected = model(pixel_values, image_sizes=image_sizes).last_hidden_state
+                model.set_attn_implementation("flash_attention_2")
+                actual = model(pixel_values, image_sizes=image_sizes).last_hidden_state
+                torch.testing.assert_close(actual, expected, atol=2e-3, rtol=2e-3)
 
     def test_vision_axial_rope(self):
         # override -> the freqs are `//2` of head dim for this model
